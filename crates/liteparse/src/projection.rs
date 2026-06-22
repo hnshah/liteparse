@@ -2877,10 +2877,16 @@ mod tests {
         let median_width = 10.0f32;
         let gap_threshold = median_width * ISOLATED_GAP_MULTIPLIER; // 30px
         
-        // Create a line where watermark fragment is truly isolated (gap > threshold):
+        // Create a line where watermark fragment is truly isolated (no close neighbors on either side):
         // Hello: x=0 to x=10
         // World: x=15 to x=25 (gap from Hello = 5px, they're close)
         // wm:    x=60 to x=68 (gap from World = 35px > 30px threshold -> isolated!)
+        //
+        // For 'wm' at x=60:
+        // - has_close_left: check if any neighbor is within 30px to the left
+        //   World's right edge = 25, gap = 60 - 25 = 35 > 30 -> NO close left neighbor
+        // - has_close_right: no neighbors to the right -> NO close right neighbor
+        // Result: !has_close_left && !has_close_right = true && true = true -> REMOVED
         let mut line = vec![
             test_item("Hello", 0.0, 100.0, 10.0, 12.0, Some(0.95)),      // x=0, right edge=10
             test_item("World", 15.0, 100.0, 10.0, 12.0, Some(0.92)),     // x=15, left edge=15, right edge=25
@@ -2926,24 +2932,9 @@ mod tests {
                 }
             }
             
-            // Item is isolated (and should be removed) if it lacks a close neighbor on EITHER side.
-            // - Text "Hello" at x=0: has_close_left=false, has_close_right=true -> isolated? YES (no left neighbor, but it's first item)
-            //   Wait, that would incorrectly remove the first item!
-            // - Text "World" at x=15: has_close_left=true, has_close_right=false -> isolated? YES (no right neighbor)
-            //   That would also incorrectly remove the last item!
-            // 
-            // BUG in my logic! An item only needs neighbors on BOTH sides to NOT be isolated.
-            // But first/last items naturally have no left/right neighbors. We should only flag
-            // as isolated if:
-            //   1. Low confidence AND
-            //   2. Lacks close neighbor on at least one side (meaning it's truly floating)
-            // 
-            // Actually, re-reading issue #289: "Don't let isolated low-confidence OCR boxes create anchors/column splits"
-            // The key is: if an item is ISOLATED (no close neighbors nearby), remove it. Not "missing one side".
-            // A first/last item in a normal line has close neighbors on ONE side and that's fine.
-            // An isolated watermark has NO close neighbors on EITHER side.
-            
-            // Fix: Mark for removal only if NEITHER close neighbor exists
+            // Item is isolated (and should be removed) only if it lacks close neighbors on BOTH sides.
+            // First/last items in a normal line have one neighbor and that's fine.
+            // An isolated watermark has NO close neighbors at all.
             if !has_close_left && !has_close_right {
                 to_remove[i] = true;
             }
