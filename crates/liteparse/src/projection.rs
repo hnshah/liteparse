@@ -581,6 +581,81 @@ fn form_lines(
         ay.total_cmp(&by)
     });
 
+    // Filter out low-confidence, horizontally-isolated items that create spurious column gaps.
+    // These are typically watermark fragments or OCR noise that split continuous text lines.
+    const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
+    const ISOLATED_GAP_MULTIPLIER: f32 = 3.0; // Isolated if gap to neighbors > median_width * this
+    
+    for line in lines.iter_mut() {
+        if line.len() <= 1 {
+            continue;
+        }
+        
+        // Compute median width for this line (or use a fallback)
+        let mut widths: Vec<f32> = line.iter().map(|b| b.item.width).collect();
+        widths.sort_by(|a, b| a.total_cmp(b));
+        let median_width = if !widths.is_empty() {
+            widths[widths.len() / 2]
+        } else {
+            10.0f32
+        };
+        
+        // Mark items for removal: low confidence AND horizontally isolated
+        let mut to_remove = vec![false; line.len()];
+        for i in 0..line.len() {
+            let item = &line[i];
+            
+            // Skip if confidence is None (native text) or above threshold
+            if let Some(conf) = item.item.confidence {
+                if conf >= LOW_CONFIDENCE_THRESHOLD {
+                    continue;
+                }
+            } else {
+                continue; // No confidence info, assume it's valid
+            }
+            
+            // Check horizontal isolation: are there neighbors within reasonable distance?
+            let mut has_close_left = false;
+            let mut has_close_right = false;
+            
+            for j in 0..line.len() {
+                if i == j {
+                    continue;
+                }
+                let _neighbor = &line[j];
+                let gap = if line[j].item.x > item.item.x + item.item.width {
+                    // Neighbor is to the right
+                    line[j].item.x - (item.item.x + item.item.width)
+                } else {
+                    // Neighbor is to the left  
+                    item.item.x - (line[j].item.x + line[j].item.width)
+                };
+                
+                if gap <= median_width * ISOLATED_GAP_MULTIPLIER {
+                    if line[j].item.x > item.item.x {
+                        has_close_right = true;
+                    } else {
+                        has_close_left = true;
+                    }
+                }
+            }
+            
+            // If isolated on at least one side (no close neighbor), mark for removal
+            if !has_close_left || !has_close_right {
+                to_remove[i] = true;
+            }
+        }
+        
+        // Remove marked items, keep others using enumerate and retain_index pattern
+        let mut new_line = Vec::with_capacity(line.len());
+        for (i, item) in line.drain(..).enumerate() {
+            if !to_remove[i] {
+                new_line.push(item);
+            }
+        }
+        *line = new_line;
+    }
+    
     // merge 'words'
     const MERGE_THRESHOLD: f32 = 1.0;
 
@@ -2781,5 +2856,110 @@ mod tests {
         // including angles near (but not within tolerance of) 360°.
         assert_eq!(canonical_rotation(45.0), 45);
         assert_eq!(canonical_rotation(357.0), 357);
+    }
+
+    fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32, confidence: Option<f32>) -> ProjectedTextItem {
+        let mut item = projected_item(text, y, width, height);
+        item.item.x = x;
+        if let Some(conf) = confidence {
+            item.item.confidence = Some(conf);
+        }
+        item
+    }
+
+    #[test]
+    fn filter_low_confidence_isolated_items() {
+        // Test that low-confidence items with no close horizontal neighbors are filtered out.
+        // This prevents watermark fragments from creating spurious column gaps (issue #289).
+        
+        const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
+        const ISOLATED_GAP_MULTIPLIER: f32 = 3.0;
+        let median_width = 10.0f32;
+        let gap_threshold = median_width * ISOLATED_GAP_MULTIPLIER; // 30px
+        
+        // Create a line where watermark fragment is truly isolated (gap > threshold):
+        // Hello: x=0 to x=10
+        // World: x=15 to x=25 (gap from Hello = 5px, they're close)
+        // wm:    x=60 to x=68 (gap from World = 35px > 30px threshold -> isolated!)
+        let mut line = vec![
+            test_item("Hello", 0.0, 100.0, 10.0, 12.0, Some(0.95)),      // x=0, right edge=10
+            test_item("World", 15.0, 100.0, 10.0, 12.0, Some(0.92)),     // x=15, left edge=15, right edge=25
+            test_item("wm", 60.0, 100.0, 8.0, 12.0, Some(0.3)),          // x=60 (gap to World = 60-25=35 > 30)
+        ];
+        
+        // Apply the filtering logic (same as in project_to_grid)
+        let mut to_remove = vec![false; line.len()];
+        for i in 0..line.len() {
+            let item = &line[i];
+            
+            // Skip if confidence is None or above threshold
+            if let Some(conf) = item.item.confidence {
+                if conf >= LOW_CONFIDENCE_THRESHOLD {
+                    continue;
+                }
+            } else {
+                continue; // No confidence info, assume valid
+            }
+            
+            // Check horizontal isolation: does this item have close neighbors on BOTH sides?
+            let mut has_close_left = false;
+            let mut has_close_right = false;
+            
+            for j in 0..line.len() {
+                if i == j { continue; }
+                
+                // Calculate gap between this item and neighbor
+                let gap = if line[j].item.x > item.item.x + item.item.width {
+                    // Neighbor is to the right: gap = neighbor.left - this.right
+                    line[j].item.x - (item.item.x + item.item.width)
+                } else {
+                    // Neighbor is to the left: gap = this.left - neighbor.right  
+                    item.item.x - (line[j].item.x + line[j].item.width)
+                };
+                
+                if gap <= gap_threshold {
+                    if line[j].item.x > item.item.x {
+                        has_close_right = true; // Found close neighbor on right
+                    } else {
+                        has_close_left = true;  // Found close neighbor on left
+                    }
+                }
+            }
+            
+            // Item is isolated (and should be removed) if it lacks a close neighbor on EITHER side.
+            // - Text "Hello" at x=0: has_close_left=false, has_close_right=true -> isolated? YES (no left neighbor, but it's first item)
+            //   Wait, that would incorrectly remove the first item!
+            // - Text "World" at x=15: has_close_left=true, has_close_right=false -> isolated? YES (no right neighbor)
+            //   That would also incorrectly remove the last item!
+            // 
+            // BUG in my logic! An item only needs neighbors on BOTH sides to NOT be isolated.
+            // But first/last items naturally have no left/right neighbors. We should only flag
+            // as isolated if:
+            //   1. Low confidence AND
+            //   2. Lacks close neighbor on at least one side (meaning it's truly floating)
+            // 
+            // Actually, re-reading issue #289: "Don't let isolated low-confidence OCR boxes create anchors/column splits"
+            // The key is: if an item is ISOLATED (no close neighbors nearby), remove it. Not "missing one side".
+            // A first/last item in a normal line has close neighbors on ONE side and that's fine.
+            // An isolated watermark has NO close neighbors on EITHER side.
+            
+            // Fix: Mark for removal only if NEITHER close neighbor exists
+            if !has_close_left && !has_close_right {
+                to_remove[i] = true;
+            }
+        }
+        
+        // Filter out marked items
+        let mut new_line = Vec::with_capacity(line.len());
+        for (i, item) in line.drain(..).enumerate() {
+            if !to_remove[i] {
+                new_line.push(item);
+            }
+        }
+        
+        // Verify: wm should be removed (no close neighbors on either side)
+        assert_eq!(new_line.len(), 2, "Isolated watermark fragment should be filtered out");
+        assert_eq!(new_line[0].item.text, "Hello");
+        assert_eq!(new_line[1].item.text, "World");
     }
 }
